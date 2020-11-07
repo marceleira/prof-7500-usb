@@ -2,7 +2,7 @@
 
 Patch for Prof Tuners 7500 USB
 
-If you need make tuner works on your linux device, just put `prof_7500_v4l_dvb.patch` on your `/lib/firmware`
+If you need make tuner works on your linux device, just put `dvb-usb-p7500.fw` on your `/lib/firmware`
 
 References:
 
