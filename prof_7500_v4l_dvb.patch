@@ -1,0 +1,775 @@
+diff -r 9ba55515b2f2 linux/drivers/media/dvb/dvb-usb/dw2102.c
+--- a/linux/drivers/media/dvb/dvb-usb/dw2102.c	Tue Dec 01 01:26:21 2009 +0200
++++ b/linux/drivers/media/dvb/dvb-usb/dw2102.c	Tue Dec 01 02:11:43 2009 +0200
+@@ -1,6 +1,7 @@
+ /* DVB USB framework compliant Linux driver for the
+ *	DVBWorld DVB-S 2101, 2102, DVB-S2 2104, DVB-C 3101,
+-*	TeVii S600, S630, S650 Cards
++*	TeVii S600, S630, S650,
++*	Prof 7500 Cards
+ * Copyright (C) 2008,2009 Igor M. Liplianin (liplianin@me.by)
+ *
+ *	This program is free software; you can redistribute it and/or modify it
+@@ -20,6 +21,13 @@
+ #include "tda1002x.h"
+ #include "mt312.h"
+ #include "zl10039.h"
++#include "stv0900.h"
++#include "stb6100.h"
++#if 0
++#include "stb6100_proc.h"
++#include "ds3000.h"
++#include "stv6110.h"
++#endif
+ 
+ #ifndef USB_PID_DW2102
+ #define USB_PID_DW2102 0x2102
+@@ -55,6 +63,10 @@
+ #define DW2102_VOLTAGE_CTRL (0x1800)
+ #define DW2102_RC_QUERY (0x1a00)
+ 
++#define	err_str "did not find the firmware file. (%s) " \
++		"Please see linux/Documentation/dvb/ for more details " \
++		"on firmware-problems."
++
+ struct dvb_usb_rc_keys_table {
+ 	struct dvb_usb_rc_key *rc_keys;
+ 	int rc_keys_size;
+@@ -442,63 +454,101 @@
+ 	return num;
+ }
+ 
+-static int s630_i2c_transfer(struct i2c_adapter *adap, struct i2c_msg msg[],
++static int s6x0_i2c_transfer(struct i2c_adapter *adap, struct i2c_msg msg[],
+ 								int num)
+ {
+ 	struct dvb_usb_device *d = i2c_get_adapdata(adap);
++	struct usb_device *udev = d->udev;
+ 	int ret = 0;
++	int len, i, j;
+ 
+ 	if (!d)
+ 		return -ENODEV;
+ 	if (mutex_lock_interruptible(&d->i2c_mutex) < 0)
+ 		return -EAGAIN;
+ 
+-	switch (num) {
+-	case 2: { /* read */
+-		u8 ibuf[msg[1].len], obuf[3];
+-		obuf[0] = msg[1].len;
+-		obuf[1] = (msg[0].addr << 1);
+-		obuf[2] = msg[0].buf[0];
+-
+-		ret = dw210x_op_rw(d->udev, 0x90, 0, 0,
+-					obuf, 3, DW210X_WRITE_MSG);
+-		msleep(5);
+-		ret = dw210x_op_rw(d->udev, 0x91, 0, 0,
+-					ibuf, msg[1].len, DW210X_READ_MSG);
+-		memcpy(msg[1].buf, ibuf, msg[1].len);
+-		break;
+-	}
+-	case 1:
+-		switch (msg[0].addr) {
+-		case 0x60:
+-		case 0x0e: {
+-			/* write to zl10313, zl10039 register, */
+-			u8 obuf[msg[0].len + 2];
+-			obuf[0] = msg[0].len + 1;
+-			obuf[1] = (msg[0].addr << 1);
+-			memcpy(obuf + 2, msg[0].buf, msg[0].len);
+-			ret = dw210x_op_rw(d->udev, 0x80, 0, 0,
+-					obuf, msg[0].len + 2, DW210X_WRITE_MSG);
+-			break;
+-		}
++	for (j = 0; j < num; j++) {
++		switch (msg[j].addr) {
+ 		case (DW2102_RC_QUERY): {
+ 			u8 ibuf[4];
+ 			ret  = dw210x_op_rw(d->udev, 0xb8, 0, 0,
+ 					ibuf, 4, DW210X_READ_MSG);
+-			msg[0].buf[0] = ibuf[3];
++			memcpy(msg[j].buf, ibuf + 1, 2);
+ 			break;
+ 		}
+ 		case (DW2102_VOLTAGE_CTRL): {
+ 			u8 obuf[2];
+-			obuf[0] = 0x03;
+-			obuf[1] = msg[0].buf[0];
++
++			obuf[0] = 1;
++			obuf[1] = msg[j].buf[1];/* off-on */
++			ret = dw210x_op_rw(d->udev, 0x8a, 0, 0,
++					obuf, 2, DW210X_WRITE_MSG);
++			obuf[0] = 3;
++			obuf[1] = msg[j].buf[0];/* 13v-18v */
+ 			ret = dw210x_op_rw(d->udev, 0x8a, 0, 0,
+ 					obuf, 2, DW210X_WRITE_MSG);
+ 			break;
+ 		}
++/*		case 0x55: cx24116
++		case 0x6a: stv0903
++		case 0x68: ds3000, stv0903
++		case 0x60: ts2020, stv6110, stb6100
++		case 0xa0: eeprom */
++		default: {
++			if (msg[j].flags == I2C_M_RD) {
++				/* read registers */
++				u8 ibuf[msg[j].len];
++				ret = dw210x_op_rw(d->udev, 0x91, 0, 0,
++						ibuf, msg[j].len,
++						DW210X_READ_MSG);
++				memcpy(msg[j].buf, ibuf, msg[j].len);
++				break;
++			} else if ((msg[j].buf[0] == 0xb0) &&
++						(msg[j].addr == 0x68)) {
++				/* write firmware */
++				u8 obuf[19];
++				obuf[0] = (msg[j].len > 16 ? 18 : msg[j].len + 1);
++				obuf[1] = msg[j].addr << 1;
++				obuf[2] = msg[j].buf[0];
++				len = msg[j].len - 1;
++				i = 1;
++				do {
++					memcpy(obuf + 3, msg[j].buf + i,
++							(len > 16 ? 16 : len));
++					ret = dw210x_op_rw(d->udev, 0x80, 0, 0,
++						obuf, (len > 16 ? 16 : len) + 3,
++						DW210X_WRITE_MSG);
++					i += 16;
++					len -= 16;
++				} while (len > 0);
++			} else if ((udev->descriptor.idProduct == 0x7500)
++					&& (j < (num - 1))) {
++				/* write register addr before read */
++				u8 obuf[msg[j].len + 2];
++				obuf[0] = msg[j + 1].len;
++				obuf[1] = (msg[j].addr << 1);
++				memcpy(obuf + 2, msg[j].buf, msg[j].len);
++				ret = dw210x_op_rw(d->udev, 0x92, 0, 0,
++						obuf, msg[j].len + 2,
++						DW210X_WRITE_MSG);
++				break;
++			} else {
++				/* write registers */
++				u8 obuf[msg[j].len + 2];
++				obuf[0] = msg[j].len + 1;
++				obuf[1] = (msg[j].addr << 1);
++				memcpy(obuf + 2, msg[j].buf, msg[j].len);
++				ret = dw210x_op_rw(d->udev,
++						(num > 1 ? 0x90 : 0x80), 0, 0,
++						obuf, msg[j].len + 2,
++						DW210X_WRITE_MSG);
++				break;
++			}
++			break;
++		}
+ 		}
+ 
+-		break;
++		msleep(3);
+ 	}
+ 
+ 	mutex_unlock(&d->i2c_mutex);
+@@ -550,8 +600,8 @@
+ #endif
+ };
+ 
+-static struct i2c_algorithm s630_i2c_algo = {
+-	.master_xfer = s630_i2c_transfer,
++static struct i2c_algorithm s6x0_i2c_algo = {
++	.master_xfer = s6x0_i2c_transfer,
+ 	.functionality = dw210x_i2c_func,
+ #ifdef NEED_ALGO_CONTROL
+ 	.algo_control = dummy_algo_control,
+@@ -582,7 +632,7 @@
+ 	return 0;
+ };
+ 
+-static int s630_read_mac_address(struct dvb_usb_device *d, u8 mac[6])
++static int s6x0_read_mac_address(struct dvb_usb_device *d, u8 mac[6])
+ {
+ 	int i, ret;
+ 	u8 buf[3], eeprom[256], eepromline[16];
+@@ -615,18 +665,25 @@
+ 
+ static int dw210x_set_voltage(struct dvb_frontend *fe, fe_sec_voltage_t voltage)
+ {
+-	static u8 command_13v[1] = {0x00};
+-	static u8 command_18v[1] = {0x01};
+-	struct i2c_msg msg[] = {
+-		{.addr = DW2102_VOLTAGE_CTRL, .flags = 0,
+-			.buf = command_13v, .len = 1},
++	static u8 command_13v[] = {0x00, 0x01};
++	static u8 command_18v[] = {0x01, 0x01};
++	static u8 command_off[] = {0x00, 0x00};
++	struct i2c_msg msg = {
++		.addr = DW2102_VOLTAGE_CTRL,
++		.flags = 0,
++		.buf = command_off,
++		.len = 2,
+ 	};
+ 
+ 	struct dvb_usb_adapter *udev_adap =
+ 		(struct dvb_usb_adapter *)(fe->dvb->priv);
+ 	if (voltage == SEC_VOLTAGE_18)
+-		msg[0].buf = command_18v;
+-	i2c_transfer(&udev_adap->dev->i2c_adap, msg, 1);
++		msg.buf = command_18v;
++	else if (voltage == SEC_VOLTAGE_13)
++		msg.buf = command_13v;
++
++	i2c_transfer(&udev_adap->dev->i2c_adap, &msg, 1);
++
+ 	return 0;
+ }
+ 
+@@ -662,6 +719,23 @@
+ 	.demod_address = 0x0e,
+ };
+ 
++static struct stv0900_config prof_7500_stv0900_config = {
++	.demod_address = 0x6a,
++	.demod_mode = 0,
++	.xtal = 27000000,
++	.clkmode = 3,/* 0-CLKI, 2-XTALI, else AUTO */
++	.diseqc_mode = 2,/* 2/3 PWM */
++	.tun1_maddress = 0,/* 0x60 */
++	.tun1_adc = 0,/* 2 Vpp */
++	.path1_mode = 3,
++	.tun1_type = 3,
++};
++#if 0
++static struct stb6100_config prof_7500_stb6100_config = {
++	.tuner_address = 0x60,
++	.refclock = 27000000,
++};
++#endif
+ static int dw2104_frontend_attach(struct dvb_usb_adapter *d)
+ {
+ 	if ((d->fe = dvb_attach(cx24116_attach, &dw2104_config,
+@@ -723,18 +797,49 @@
+ 	return -EIO;
+ }
+ 
+-static int s630_frontend_attach(struct dvb_usb_adapter *d)
++static int s6x0_frontend_attach(struct dvb_usb_adapter *d)
+ {
+ 	d->fe = dvb_attach(mt312_attach, &zl313_config,
+-				&d->dev->i2c_adap);
++			&d->dev->i2c_adap);
+ 	if (d->fe != NULL) {
+-		d->fe->ops.set_voltage = dw210x_set_voltage;
+-		info("Attached zl10313!\n");
+-		return 0;
++		if (dvb_attach(zl10039_attach, d->fe, 0x60,
++				&d->dev->i2c_adap)) {
++			d->fe->ops.set_voltage = dw210x_set_voltage;
++			info("Attached zl100313+zl10039!\n");
++			return 0;
++		}
+ 	}
++
+ 	return -EIO;
+ }
+ 
++static int prof_7500_frontend_attach(struct dvb_usb_adapter *d)
++{
++#if 0
++	struct dvb_tuner_ops *tun_ops = NULL;
++#endif
++	d->fe = dvb_attach(stv0900_attach, &prof_7500_stv0900_config,
++					&d->dev->i2c_adap, 0);
++	if (d->fe == NULL)
++		return -EIO;
++#if 0
++	if (!dvb_attach(stb6100_attach, d->fe, &prof_7500_stb6100_config,
++					&d->dev->i2c_adap))
++		return -EIO;
++
++	tun_ops = &d->fe->ops.tuner_ops;
++	tun_ops->set_frequency = stb6100_set_freq;
++	tun_ops->get_frequency = stb6100_get_freq;
++	tun_ops->set_bandwidth = stb6100_set_bandw;
++	tun_ops->get_bandwidth = stb6100_get_bandw;
++#endif
++	d->fe->ops.set_voltage = dw210x_set_voltage;
++
++	info("Attached STV0900+STB6100A!\n");
++
++	return 0;
++}
++
+ static int dw2102_tuner_attach(struct dvb_usb_adapter *adap)
+ {
+ 	dvb_attach(dvb_pll_attach, adap->fe, 0x60,
+@@ -758,14 +863,6 @@
+ 	return 0;
+ }
+ 
+-static int s630_zl10039_tuner_attach(struct dvb_usb_adapter *adap)
+-{
+-	dvb_attach(zl10039_attach, adap->fe, 0x60,
+-		&adap->dev->i2c_adap);
+-
+-	return 0;
+-}
+-
+ static struct dvb_usb_rc_key dw210x_rc_keys[] = {
+ 	{ 0xf80a, KEY_Q },		/*power*/
+ 	{ 0xf80c, KEY_M },		/*mute*/
+@@ -932,17 +1029,7 @@
+ 	return 0;
+ }
+ 
+-static struct usb_device_id dw2102_table[] = {
+-	{USB_DEVICE(USB_VID_CYPRESS, USB_PID_DW2102)},
+-	{USB_DEVICE(USB_VID_CYPRESS, 0x2101)},
+-	{USB_DEVICE(USB_VID_CYPRESS, USB_PID_DW2104)},
+-	{USB_DEVICE(0x9022, USB_PID_TEVII_S650)},
+-	{USB_DEVICE(USB_VID_TERRATEC, USB_PID_CINERGY_S)},
+-	{USB_DEVICE(USB_VID_CYPRESS, USB_PID_DW3101)},
+-	{USB_DEVICE(0x9022, USB_PID_TEVII_S630)},
+-	{ }
+-};
+-
++static struct usb_device_id dw2102_table[];
+ MODULE_DEVICE_TABLE(usb, dw2102_table);
+ 
+ static int dw2102_load_firmware(struct usb_device *dev,
+@@ -959,9 +1046,7 @@
+ 	case 0x2101:
+ 		ret = request_firmware(&fw, filename, &dev->dev);
+ 		if (ret != 0) {
+-			err("did not find the firmware file. (%s) "
+-			"Please see linux/Documentation/dvb/ for more details "
+-			"on firmware-problems.", filename);
++			err(err_str, filename);
+ 			return ret;
+ 		}
+ 		break;
+@@ -1202,13 +1287,13 @@
+ 	}
+ };
+ 
+-static struct dvb_usb_device_properties s630_properties = {
++static struct dvb_usb_device_properties s6x0_properties = {
+ 	.caps = DVB_USB_IS_AN_I2C_ADAPTER,
+ 	.usb_ctrl = DEVICE_SPECIFIC,
+ 	.firmware = "dvb-usb-s630.fw",
+ 	.no_reconnect = 1,
+ 
+-	.i2c_algo = &s630_i2c_algo,
++	.i2c_algo = &s6x0_i2c_algo,
+ 	.rc_key_map = tevii_rc_keys,
+ 	.rc_key_map_size = ARRAY_SIZE(tevii_rc_keys),
+ 	.rc_interval = 150,
+@@ -1217,12 +1302,12 @@
+ 	.generic_bulk_ctrl_endpoint = 0x81,
+ 	.num_adapters = 1,
+ 	.download_firmware = dw2102_load_firmware,
+-	.read_mac_address = s630_read_mac_address,
++	.read_mac_address = s6x0_read_mac_address,
+ 	.adapter = {
+ 		{
+-			.frontend_attach = s630_frontend_attach,
++			.frontend_attach = s6x0_frontend_attach,
+ 			.streaming_ctrl = NULL,
+-			.tuner_attach = s630_zl10039_tuner_attach,
++			.tuner_attach = NULL,
+ 			.stream = {
+ 				.type = USB_BULK,
+ 				.count = 8,
+@@ -1244,16 +1329,38 @@
+ 	}
+ };
+ 
++static struct dvb_usb_device_properties *p7500 = NULL;
++static struct dvb_usb_device_description d7500 = {
++	"Prof 7500 USB DVB-S2",
++	{&dw2102_table[7], NULL},
++	{NULL},
++};
++
+ static int dw2102_probe(struct usb_interface *intf,
+-		const struct usb_device_id *id)
++				const struct usb_device_id *id)
+ {
++	p7500 = kzalloc(sizeof(struct dvb_usb_device_properties), GFP_KERNEL);
++	if (!p7500)
++		return -ENOMEM;
++	/* copy defaul structure */
++	memcpy(p7500, &s6x0_properties,
++			sizeof(struct dvb_usb_device_properties));
++	/* fill only different fields */
++	p7500->firmware = "dvb-usb-p7500.fw";
++	p7500->devices[0] = d7500;
++	p7500->rc_key_map = tbs_rc_keys;
++	p7500->rc_key_map_size = ARRAY_SIZE(tbs_rc_keys);
++	p7500->adapter->frontend_attach = prof_7500_frontend_attach;
++
+ 	if (0 == dvb_usb_device_init(intf, &dw2102_properties,
+ 			THIS_MODULE, NULL, adapter_nr) ||
+ 	    0 == dvb_usb_device_init(intf, &dw2104_properties,
+ 			THIS_MODULE, NULL, adapter_nr) ||
+ 	    0 == dvb_usb_device_init(intf, &dw3101_properties,
+ 			THIS_MODULE, NULL, adapter_nr) ||
+-	    0 == dvb_usb_device_init(intf, &s630_properties,
++	    0 == dvb_usb_device_init(intf, &s6x0_properties,
++			THIS_MODULE, NULL, adapter_nr) ||
++	    0 == dvb_usb_device_init(intf, p7500,
+ 			THIS_MODULE, NULL, adapter_nr)) {
+ 		return 0;
+ 	}
+@@ -1281,12 +1388,25 @@
+ 	usb_deregister(&dw2102_driver);
+ }
+ 
++static struct usb_device_id dw2102_table[] = {
++/* 0*/	{USB_DEVICE(USB_VID_CYPRESS, USB_PID_DW2102)},
++	{USB_DEVICE(USB_VID_CYPRESS, 0x2101)},
++/* 2*/	{USB_DEVICE(USB_VID_CYPRESS, USB_PID_DW2104)},
++	{USB_DEVICE(0x9022, USB_PID_TEVII_S650)},
++/* 4*/	{USB_DEVICE(USB_VID_TERRATEC, USB_PID_CINERGY_S)},
++	{USB_DEVICE(USB_VID_CYPRESS, USB_PID_DW3101)},
++/* 6*/	{USB_DEVICE(0x9022, USB_PID_TEVII_S630)},
++	{USB_DEVICE(0x3034, 0x7500)},
++	{ },
++};
++
+ module_init(dw2102_module_init);
+ module_exit(dw2102_module_exit);
+ 
+ MODULE_AUTHOR("Igor M. Liplianin (c) liplianin@me.by");
+ MODULE_DESCRIPTION("Driver for DVBWorld DVB-S 2101, 2102, DVB-S2 2104,"
+ 				" DVB-C 3101 USB2.0,"
+-				" TeVii S600, S630, S650 USB2.0 devices");
++				" TeVii S600, S630, S650 USB2.0,"
++				" Prof 7500 devices");
+ MODULE_VERSION("0.1");
+ MODULE_LICENSE("GPL");
+diff -r 9ba55515b2f2 linux/drivers/media/dvb/frontends/stv0900.h
+--- a/linux/drivers/media/dvb/frontends/stv0900.h	Tue Dec 01 01:26:21 2009 +0200
++++ b/linux/drivers/media/dvb/frontends/stv0900.h	Tue Dec 01 02:11:43 2009 +0200
+@@ -49,6 +49,8 @@
+ 	u8 tun2_maddress;
+ 	u8 tun1_adc;/* 1 for stv6110, 2 for stb6100 */
+ 	u8 tun2_adc;
++	u8 tun1_type;/* for now 3 for stb6100 auto, else - software */
++	u8 tun2_type;
+ 	/* Set device param to start dma */
+ 	int (*set_ts_params)(struct dvb_frontend *fe, int is_punctured);
+ };
+diff -r 9ba55515b2f2 linux/drivers/media/dvb/frontends/stv0900_core.c
+--- a/linux/drivers/media/dvb/frontends/stv0900_core.c	Tue Dec 01 01:26:21 2009 +0200
++++ b/linux/drivers/media/dvb/frontends/stv0900_core.c	Tue Dec 01 02:11:43 2009 +0200
+@@ -567,6 +567,46 @@
+ 	}
+ }
+ 
++u32 stv0900_get_freq_auto(struct stv0900_internal *intp, int demod)
++{
++	u32 freq, round;
++	/*	Formulat :
++	Tuner_Frequency(MHz)	= Regs /64
++	Tuner_granularity(MHz)	= Regs	/2048
++	real_Tuner_Frequency =	Tuner_Frequency(MHz) - Tuner_granularity(MHz) 
++	*/
++	freq = (stv0900_get_bits(intp, TUN_RFFREQ2) << 10) +
++		(stv0900_get_bits(intp, TUN_RFFREQ1) << 2) +
++		stv0900_get_bits(intp, TUN_RFFREQ0);
++
++	freq = (freq * 1000) / 64;
++
++	round = (stv0900_get_bits(intp, TUN_RFRESTE1) >> 2) +
++		stv0900_get_bits(intp, TUN_RFRESTE0);
++
++	round = (round * 1000) / 2048;	
++
++	return freq + round;
++}
++
++void stv0900_set_tuner_auto(struct stv0900_internal *intp, u32 Frequency,
++						u32 Bandwidth, int demod)
++{
++	u32 tunerFrequency;
++	/*	Formulat:
++	Tuner_frequency_reg= Frequency(MHz)*64
++	*/
++	tunerFrequency = (Frequency * 64) / 1000;
++
++	stv0900_write_bits(intp, TUN_RFFREQ2, (tunerFrequency >> 10));
++	stv0900_write_bits(intp, TUN_RFFREQ1, (tunerFrequency >> 2) & 0xff);
++	stv0900_write_bits(intp, TUN_RFFREQ0, (tunerFrequency & 0x03));
++	/*Low Pass Filter = BW /2 (MHz)	*/ 
++	stv0900_write_bits(intp, TUN_BW, Bandwidth / 2000000);
++	/*Tuner Write trig	*/
++	stv0900_write_reg(intp, TNRLD, 1);
++}
++
+ static s32 stv0900_get_rf_level(struct stv0900_internal *intp,
+ 				const struct stv0900_table *lookup,
+ 				enum fe_stv0900_demod_num demod)
+@@ -1329,7 +1369,6 @@
+ 	enum fe_stv0900_error error = STV0900_NO_ERROR;
+ 	enum fe_stv0900_error demodError = STV0900_NO_ERROR;
+ 	struct stv0900_internal *intp = NULL;
+-
+ 	int selosci, i;
+ 
+ 	struct stv0900_inode *temp_int = find_inode(state->i2c_adap,
+@@ -1404,6 +1443,27 @@
+ 		stv0900_write_bits(intp, F0900_P1_RST_HWARE, 0);
+ 	}
+ 
++	intp->tuner_type[0] = p_init->tuner1_type;
++	intp->tuner_type[1] = p_init->tuner2_type;
++	/* tuner init */
++	switch(p_init->tuner1_type) {
++	case 3: /*FE_AUTO_STB6100:*/
++		stv0900_write_reg(intp, R0900_P1_TNRCFG, 0x3c);
++		stv0900_write_reg(intp, R0900_P1_TNRCFG2, 0x86);
++		stv0900_write_reg(intp, R0900_P1_TNRCFG3, 0x18); 
++		stv0900_write_reg(intp, R0900_P1_TNRXTAL, 27); /* 27MHz */
++		stv0900_write_reg(intp, R0900_P1_TNRSTEPS, 0x05);
++		stv0900_write_reg(intp, R0900_P1_TNRGAIN, 0x17);
++		stv0900_write_reg(intp, R0900_P1_TNRADJ, 0x1f);
++		stv0900_write_reg(intp, R0900_P1_TNRCTL2, 0x0);
++		stv0900_write_bits(intp, F0900_P1_TUN_TYPE, 3);
++		break;
++	/* case FE_SW_TUNER: */
++	default:
++		stv0900_write_bits(intp, F0900_P1_TUN_TYPE, 6);
++		break;
++	}
++
+ 	stv0900_write_bits(intp, F0900_P1_TUN_MADDRESS, p_init->tun1_maddress);
+ 	switch (p_init->tuner1_adc) {
+ 	case 1:
+@@ -1413,6 +1473,27 @@
+ 		break;
+ 	}
+ 
++	stv0900_write_reg(intp, R0900_P1_TNRLD, 1); /* hw tuner */
++
++	/* tuner init */
++	switch(p_init->tuner2_type) {
++	case 3: /*FE_AUTO_STB6100:*/
++		stv0900_write_reg(intp, R0900_P2_TNRCFG, 0x3c);
++		stv0900_write_reg(intp, R0900_P2_TNRCFG2, 0x86);
++		stv0900_write_reg(intp, R0900_P2_TNRCFG3, 0x18); 
++		stv0900_write_reg(intp, R0900_P2_TNRXTAL, 27); /* 27MHz */
++		stv0900_write_reg(intp, R0900_P2_TNRSTEPS, 0x05);
++		stv0900_write_reg(intp, R0900_P2_TNRGAIN, 0x17);
++		stv0900_write_reg(intp, R0900_P2_TNRADJ, 0x1f);
++		stv0900_write_reg(intp, R0900_P2_TNRCTL2, 0x0);
++		stv0900_write_bits(intp, F0900_P2_TUN_TYPE, 3);
++		break;
++	/* case FE_SW_TUNER: */
++	default:
++		stv0900_write_bits(intp, F0900_P2_TUN_TYPE, 6);
++		break;
++	}
++
+ 	stv0900_write_bits(intp, F0900_P2_TUN_MADDRESS, p_init->tun2_maddress);
+ 	switch (p_init->tuner2_adc) {
+ 	case 1:
+@@ -1422,6 +1503,8 @@
+ 		break;
+ 	}
+ 
++	stv0900_write_reg(intp, R0900_P2_TNRLD, 1); /* hw tuner */
++
+ 	stv0900_write_bits(intp, F0900_P1_TUN_IQSWAP, p_init->tun1_iq_inv);
+ 	stv0900_write_bits(intp, F0900_P2_TUN_IQSWAP, p_init->tun2_iq_inv);
+ 	stv0900_set_mclk(intp, 135000000);
+@@ -1494,9 +1577,6 @@
+ 	if (!(INRANGE(100000, c->symbol_rate, 70000000)))
+ 		return DVBFE_ALGO_SEARCH_FAILED;
+ 
+-	if (state->config->set_ts_params)
+-		state->config->set_ts_params(fe, 0);
+-
+ 	p_result.locked = FALSE;
+ 	p_search.path = demod;
+ 	p_search.frequency = c->frequency;
+@@ -1818,10 +1898,12 @@
+ 		init_params.tun1_maddress	= config->tun1_maddress;
+ 		init_params.tun1_iq_inv		= STV0900_IQ_NORMAL;
+ 		init_params.tuner1_adc		= config->tun1_adc;
++		init_params.tuner1_type		= config->tun1_type;
+ 		init_params.path2_ts_clock	= config->path2_mode;
+ 		init_params.ts_config		= config->ts_config_regs;
+ 		init_params.tun2_maddress	= config->tun2_maddress;
+ 		init_params.tuner2_adc		= config->tun2_adc;
++		init_params.tuner2_type		= config->tun2_type;
+ 		init_params.tun2_iq_inv		= STV0900_IQ_SWAPPED;
+ 
+ 		err_stv0900 = stv0900_init_internal(&state->frontend,
+diff -r 9ba55515b2f2 linux/drivers/media/dvb/frontends/stv0900_priv.h
+--- a/linux/drivers/media/dvb/frontends/stv0900_priv.h	Tue Dec 01 01:26:21 2009 +0200
++++ b/linux/drivers/media/dvb/frontends/stv0900_priv.h	Tue Dec 01 02:11:43 2009 +0200
+@@ -247,6 +247,7 @@
+ 
+ 	u8	tun1_maddress;
+ 	int	tuner1_adc;
++	int 	tuner1_type;
+ 
+ 	/* IQ from the tuner1 to the demod */
+ 	enum stv0900_iq_inversion	tun1_iq_inv;
+@@ -254,6 +255,7 @@
+ 
+ 	u8	tun2_maddress;
+ 	int	tuner2_adc;
++	int	tuner2_type;
+ 
+ 	/* IQ from the tuner2 to the demod */
+ 	enum stv0900_iq_inversion	tun2_iq_inv;
+@@ -309,6 +311,8 @@
+ 	s32	bw[2];
+ 	s32	symbol_rate[2];
+ 	s32	srch_range[2];
++	/* for software/auto tuner */
++	int	tuner_type[2];
+ 
+ 	/* algorithm for search Blind, Cold or Warm*/
+ 	enum fe_stv0900_search_algo	srch_algo[2];
+@@ -394,4 +398,11 @@
+ fe_stv0900_tracking_standard stv0900_get_standard(struct dvb_frontend *fe,
+ 				enum fe_stv0900_demod_num demod);
+ 
++extern u32
++stv0900_get_freq_auto(struct stv0900_internal *intp, int demod);
++
++extern void
++stv0900_set_tuner_auto(struct stv0900_internal *intp, u32 Frequency,
++						u32 Bandwidth, int demod);
++
+ #endif
+diff -r 9ba55515b2f2 linux/drivers/media/dvb/frontends/stv0900_reg.h
+--- a/linux/drivers/media/dvb/frontends/stv0900_reg.h	Tue Dec 01 01:26:21 2009 +0200
++++ b/linux/drivers/media/dvb/frontends/stv0900_reg.h	Tue Dec 01 02:11:43 2009 +0200
+@@ -3174,17 +3174,21 @@
+ #define R0900_P1_TNRRF1 0xf4e9
+ #define TNRRF1 REGx(R0900_P1_TNRRF1)
+ #define F0900_P1_TUN_RFFREQ2 0xf4e900ff
++#define TUN_RFFREQ2 FLDx(F0900_P1_TUN_RFFREQ2)
+ 
+ /*P1_TNRRF0*/
+ #define R0900_P1_TNRRF0 0xf4ea
+ #define TNRRF0 REGx(R0900_P1_TNRRF0)
+ #define F0900_P1_TUN_RFFREQ1 0xf4ea00ff
++#define TUN_RFFREQ1 FLDx(F0900_P1_TUN_RFFREQ1)
+ 
+ /*P1_TNRBW*/
+ #define R0900_P1_TNRBW 0xf4eb
+ #define TNRBW REGx(R0900_P1_TNRBW)
+ #define F0900_P1_TUN_RFFREQ0 0xf4eb00c0
++#define TUN_RFFREQ0 FLDx(F0900_P1_TUN_RFFREQ0)
+ #define F0900_P1_TUN_BW 0xf4eb003f
++#define TUN_BW FLDx(F0900_P1_TUN_BW)
+ 
+ /*P1_TNRADJ*/
+ #define R0900_P1_TNRADJ 0xf4ec
+@@ -3234,11 +3238,13 @@
+ #define F0900_P1_TUN_I2CLOCKED 0xf4f60010
+ #define F0900_P1_TUN_PROGDONE 0xf4f6000c
+ #define F0900_P1_TUN_RFRESTE1 0xf4f60003
++#define TUN_RFRESTE1 FLDx(F0900_P1_TUN_RFRESTE1)
+ 
+ /*P1_TNRRESTE*/
+ #define R0900_P1_TNRRESTE 0xf4f7
+ #define TNRRESTE REGx(R0900_P1_TNRRESTE)
+ #define F0900_P1_TUN_RFRESTE0 0xf4f700ff
++#define TUN_RFRESTE0 FLDx(F0900_P1_TUN_RFRESTE0)
+ 
+ /*P1_SMAPCOEF7*/
+ #define R0900_P1_SMAPCOEF7 0xf500
+diff -r 9ba55515b2f2 linux/drivers/media/dvb/frontends/stv0900_sw.c
+--- a/linux/drivers/media/dvb/frontends/stv0900_sw.c	Tue Dec 01 01:26:21 2009 +0200
++++ b/linux/drivers/media/dvb/frontends/stv0900_sw.c	Tue Dec 01 02:11:43 2009 +0200
+@@ -606,7 +606,12 @@
+ 			tuner_freq -= (current_step * currier_step);
+ 
+ 		if (intp->chip_id <= 0x20) {
+-			stv0900_set_tuner(fe, tuner_freq, intp->bw[d]);
++			if (intp->tuner_type[d] == 3)
++				stv0900_set_tuner_auto(intp, tuner_freq,
++						intp->bw[d], demod);
++			else
++				stv0900_set_tuner(fe, tuner_freq, intp->bw[d]);
++			
+ 			stv0900_write_reg(intp, DMDISTATE, 0x1c);
+ 			stv0900_write_reg(intp, CFRINIT1, 0);
+ 			stv0900_write_reg(intp, CFRINIT0, 0);
+@@ -976,8 +981,16 @@
+ 					intp->rolloff) + 10000000;
+ 
+ 		if ((intp->chip_id >= 0x20) || (blind_tun_sw == 1)) {
+-			if (intp->srch_algo[demod] != STV0900_WARM_START)
+-				stv0900_set_bandwidth(fe, intp->bw[demod]);
++			if (intp->srch_algo[demod] != STV0900_WARM_START) {
++				if (intp->tuner_type[demod] == 3)
++					stv0900_set_tuner_auto(intp,
++							intp->freq[demod],
++							intp->bw[demod],
++							demod);
++				else
++					stv0900_set_bandwidth(fe,
++							intp->bw[demod]);
++			}
+ 		}
+ 
+ 		if ((intp->srch_algo[demod] == STV0900_BLIND_SEARCH) ||
+@@ -1202,7 +1215,11 @@
+ 	}
+ 
+ 	result->standard = stv0900_get_standard(fe, d);
+-	result->frequency = stv0900_get_tuner_freq(fe);
++	if (intp->tuner_type[demod] == 3)
++		result->frequency = stv0900_get_freq_auto(intp, d);
++	else
++		result->frequency = stv0900_get_tuner_freq(fe);
++
+ 	offsetFreq = stv0900_get_carr_freq(intp, intp->mclk, d) / 1000;
+ 	result->frequency += offsetFreq;
+ 	result->symbol_rate = stv0900_get_symbol_rate(intp, intp->mclk, d);
+@@ -1239,7 +1256,11 @@
+ 	if ((intp->srch_algo[d] == STV0900_BLIND_SEARCH) ||
+ 				(intp->symbol_rate[d] < 10000000)) {
+ 		offsetFreq = result->frequency - intp->freq[d];
+-		intp->freq[d] = stv0900_get_tuner_freq(fe);
++		if (intp->tuner_type[demod] == 3)
++			intp->freq[d] = stv0900_get_freq_auto(intp, d);
++		else
++			intp->freq[d] = stv0900_get_tuner_freq(fe);
++
+ 		if (ABS(offsetFreq) <= ((intp->srch_range[d] / 2000) + 500))
+ 			range = STV0900_RANGEOK;
+ 		else if (ABS(offsetFreq) <=
+@@ -1481,7 +1502,12 @@
+ 			else
+ 				tuner_freq -= (current_step * currier_step);
+ 
+-			stv0900_set_tuner(fe, tuner_freq, intp->bw[demod]);
++			if (intp->tuner_type[demod] == 3)
++				stv0900_set_tuner_auto(intp, tuner_freq,
++						intp->bw[demod], demod);
++			else
++				stv0900_set_tuner(fe, tuner_freq,
++						intp->bw[demod]);
+ 		}
+ 	}
+ 
+@@ -1875,7 +1901,11 @@
+ 
+ 	}
+ 
+-	stv0900_set_tuner(fe, intp->freq[demod], intp->bw[demod]);
++	if (intp->tuner_type[demod] == 3)
++		stv0900_set_tuner_auto(intp, intp->freq[demod],
++				intp->bw[demod], demod);
++	else
++		stv0900_set_tuner(fe, intp->freq[demod], intp->bw[demod]);
+ 
+ 	agc1_power = MAKEWORD(stv0900_get_bits(intp, AGCIQ_VALUE1),
+ 				stv0900_get_bits(intp, AGCIQ_VALUE0));
